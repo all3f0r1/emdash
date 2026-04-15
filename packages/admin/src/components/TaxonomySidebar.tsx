@@ -6,7 +6,7 @@
  * - Tag input for flat taxonomies (tags)
  */
 
-import { Input, Label } from "@cloudflare/kumo";
+import { Button, Input, Label } from "@cloudflare/kumo";
 import { useLingui } from "@lingui/react/macro";
 import { Plus, X } from "@phosphor-icons/react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -420,14 +420,15 @@ function TaxonomySection({
 								autoFocus
 								disabled={createTermMutation.isPending}
 							/>
-							<button
+							<Button
 								type="button"
 								onClick={handleCreateCategory}
-								disabled={!newCategoryLabel.trim() || createTermMutation.isPending}
-								className="px-2 py-1 text-sm bg-kumo-accent text-white rounded hover:bg-kumo-accent/90 disabled:opacity-50"
+								disabled={!newCategoryLabel.trim()}
+								loading={createTermMutation.isPending}
+								variant="primary"
 							>
-								{createTermMutation.isPending ? "..." : t`Add`}
-							</button>
+								{t`Add`}
+							</Button>
 						</div>
 					) : (
 						<button
