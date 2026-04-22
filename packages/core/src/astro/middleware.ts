@@ -47,6 +47,7 @@ import type { SandboxRunner } from "../plugins/sandbox/types.js";
 import type { ResolvedPlugin } from "../plugins/types.js";
 import { getRequestContext, runWithContext } from "../request-context.js";
 import type { EmDashConfig } from "./integration/runtime.js";
+import { buildEmDashCsp, generateNonce, injectNonceAttributes } from "./middleware/csp.js";
 import type { EmDashHandlers } from "./types.js";
 
 // Cached runtime instance (persists across requests within worker)
@@ -175,18 +176,47 @@ async function getRuntime(
 const ASTRO_COOKIES_SYMBOL = Symbol.for("astro.cookies");
 
 /**
- * Baseline security headers applied to all responses.
- * Admin routes get additional headers (strict CSP) from auth middleware.
+ * Finalize response: nonce injection + CSP for HTML, baseline headers for all.
+ * Preserves Astro cookie forwarding and Server-Timing.
  */
-function finalizeResponse(
+async function finalizeResponse(
 	response: Response,
+	nonce: string,
 	serverTimings?: Array<{ name: string; dur: number; desc?: string }>,
-): Response {
-	const res = new Response(response.body, response);
+): Promise<Response> {
+	const contentType = response.headers.get("content-type");
+	const isHtml = contentType?.includes("text/html");
 	const astroCookies = Reflect.get(response, ASTRO_COOKIES_SYMBOL);
-	if (astroCookies !== undefined) {
-		Reflect.set(res, ASTRO_COOKIES_SYMBOL, astroCookies);
+
+	if (isHtml) {
+		const html = await response.text();
+		const processed = injectNonceAttributes(html, nonce);
+		const res = new Response(processed, {
+			status: response.status,
+			statusText: response.statusText,
+			headers: response.headers,
+		});
+		if (astroCookies !== undefined) Reflect.set(res, ASTRO_COOKIES_SYMBOL, astroCookies);
+		res.headers.set("X-Content-Type-Options", "nosniff");
+		res.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+		res.headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
+		res.headers.set("Content-Security-Policy", buildEmDashCsp(nonce, import.meta.env.DEV));
+		if (serverTimings && serverTimings.length > 0) {
+			res.headers.set(
+				"Server-Timing",
+				serverTimings
+					.map((t) => {
+						const dur = Math.round(t.dur);
+						return t.desc ? `${t.name};dur=${dur};desc="${t.desc}"` : `${t.name};dur=${dur}`;
+					})
+					.join(", "),
+			);
+		}
+		return res;
 	}
+
+	const res = new Response(response.body, response);
+	if (astroCookies !== undefined) Reflect.set(res, ASTRO_COOKIES_SYMBOL, astroCookies);
 	res.headers.set("X-Content-Type-Options", "nosniff");
 	res.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
 	res.headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
@@ -231,6 +261,11 @@ function createRequestScopedDb(
 export const onRequest = defineMiddleware(async (context, next) => {
 	const { request, locals, cookies } = context;
 	const url = context.url;
+
+	// Generate per-request CSP nonce — available to all downstream middleware and
+	// Astro components via locals.cspNonce, and to query functions via ALS.
+	const nonce = generateNonce();
+	locals.cspNonce = nonce;
 
 	const queryRecorder = isInstrumentationEnabled()
 		? createRecorder(url.pathname, request.method, request.headers.get("x-perf-phase") ?? "default")
@@ -331,13 +366,13 @@ export const onRequest = defineMiddleware(async (context, next) => {
 					const response = await next();
 					timings.push({ name: "render", dur: performance.now() - t0, desc: "Page render" });
 					timings.push({ name: "mw", dur: performance.now() - mwStart, desc: "Total middleware" });
-					return finalizeResponse(response, timings);
+					return finalizeResponse(response, nonce, timings);
 				};
 				if (anonScoped) {
 					const parent = getRequestContext();
 					const ctx = parent
-						? { ...parent, db: anonScoped.db }
-						: { editMode: false, db: anonScoped.db };
+						? { ...parent, db: anonScoped.db, nonce }
+						: { editMode: false, db: anonScoped.db, nonce };
 					return runWithContext(ctx, async () => {
 						const response = await runAnon();
 						anonScoped.commit();
@@ -351,7 +386,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
 		const config = getConfig();
 		if (!config) {
 			console.error("EmDash: No configuration found");
-			return finalizeResponse(await next());
+			return finalizeResponse(await next(), nonce);
 		}
 
 		// In playground mode, wrap the entire runtime init + request handling in
@@ -485,12 +520,14 @@ export const onRequest = defineMiddleware(async (context, next) => {
 				const response = await next();
 				timings.push({ name: "render", dur: performance.now() - t0, desc: "Page render" });
 				timings.push({ name: "mw", dur: performance.now() - mwStart, desc: "Total middleware" });
-				return finalizeResponse(response, timings);
+				return finalizeResponse(response, nonce, timings);
 			};
 
 			if (scoped) {
 				const parent = getRequestContext();
-				const ctx = parent ? { ...parent, db: scoped.db } : { editMode: false, db: scoped.db };
+				const ctx = parent
+					? { ...parent, db: scoped.db, nonce }
+					: { editMode: false, db: scoped.db, nonce };
 				return runWithContext(ctx, async () => {
 					const response = await renderAndFinalize();
 					scoped.commit();
@@ -510,8 +547,8 @@ export const onRequest = defineMiddleware(async (context, next) => {
 			// derived caches (manifest, taxonomy defs) rebuild against it.
 			const parent = getRequestContext();
 			const ctx = parent
-				? { ...parent, editMode, db: playgroundDb, dbIsIsolated: true }
-				: { editMode, db: playgroundDb, dbIsIsolated: true };
+				? { ...parent, editMode, db: playgroundDb, dbIsIsolated: true, nonce }
+				: { editMode, db: playgroundDb, dbIsIsolated: true, nonce };
 			return runWithContext(ctx, doInit);
 		}
 		return doInit();
@@ -519,7 +556,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
 
 	if (queryRecorder) {
 		try {
-			return await runWithContext({ editMode: false, queryRecorder }, run);
+			return await runWithContext({ editMode: false, queryRecorder, nonce }, run);
 		} finally {
 			flushRecorder(queryRecorder);
 		}
