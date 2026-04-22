@@ -51,8 +51,8 @@ export interface ContentTypeEditorProps {
 	isNew?: boolean;
 	isSaving?: boolean;
 	onSave: (input: CreateCollectionInput | UpdateCollectionInput) => void;
-	onAddField?: (input: CreateFieldInput) => void;
-	onUpdateField?: (fieldSlug: string, input: CreateFieldInput) => void;
+	onAddField?: (input: CreateFieldInput) => Promise<SchemaField>;
+	onUpdateField?: (fieldSlug: string, input: CreateFieldInput) => Promise<SchemaField>;
 	onDeleteField?: (fieldSlug: string) => void;
 	onReorderFields?: (fieldSlugs: string[]) => void;
 }
@@ -282,9 +282,9 @@ export function ContentTypeEditor({
 		setFieldSaving(true);
 		try {
 			if (editingField) {
-				onUpdateField?.(editingField.slug, input);
+				await onUpdateField?.(editingField.slug, input);
 			} else {
-				onAddField?.(input);
+				await onAddField?.(input);
 			}
 			setFieldEditorOpen(false);
 			setEditingField(undefined);
